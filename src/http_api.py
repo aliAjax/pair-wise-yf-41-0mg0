@@ -71,7 +71,11 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -87,6 +91,9 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if parts[:2] == ["api", "publications"]:
+                    event_id = parts[2] if len(parts) == 3 else None
+                    return self._send(200, {"items": service.publications(event_id)})
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
@@ -94,9 +101,10 @@ def create_handler(service, rules, static_dir):
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
+                    event_id = query.get("event_id", [None])[0]
                     return self._send(
                         200,
-                        {"items": service.list(parts[1], status=status)},
+                        {"items": service.list(parts[1], status=status, event_id=event_id)},
                     )
                 raise NotFoundError("not found")
             except Exception as exc:
@@ -138,6 +146,12 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 3 and parts[:2] == ["api", "reports"] and parts[2] == "import":
+                    body = self._body()
+                    rows = body.get("reports")
+                    if rows is None:
+                        rows = body.get("items")
+                    return self._send(200, service.import_reports(actor, rows))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

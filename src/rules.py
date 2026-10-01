@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -14,18 +14,91 @@ def _validate_station(actor, data, lookup):
 
 
 def _validate_event(actor, data, lookup):
-    reports = data.get("reports") or []
-    if len(reports) < 2:
-        raise ValidationError("event requires at least two station reports")
     if not data.get("title"):
         raise ValidationError("event title is required")
 
 
+def _count_event_reports(event, lookup):
+    """Count report records currently owned by the event."""
+    if lookup is None:
+        return 0
+    return len(lookup("report", "event_id", event["id"]) or [])
+
+
 def _validate_associate(actor, entity, data, lookup):
-    reports = entity["data"].get("reports") or []
-    if len(reports) < 2:
+    count = _count_event_reports(entity, lookup)
+    if count < 2:
         raise ValidationError("two reports are required for association")
-    return {"associated_count": len(reports)}
+    return {"associated_count": count}
+
+
+def _validate_report(actor, data, lookup):
+    event_id = data.get("event_id")
+    if not event_id:
+        raise ValidationError("report event_id is required")
+    if lookup is not None:
+        event = _find_one(lookup, "event", "id", event_id)
+        if not event:
+            raise ValidationError("event not found: " + str(event_id))
+    # A report belongs to exactly one event; the code must be unique.
+    if lookup is not None and _find_one(lookup, "report", "code", data.get("code")):
+        raise ConflictError(
+            "report code already exists: " + str(data.get("code")),
+            {"field": "code", "code": data.get("code")},
+        )
+
+
+def _validate_reassign(actor, entity, data, lookup):
+    target_event_id = data.get("event_id")
+    if not target_event_id:
+        raise ValidationError("event_id is required")
+    if target_event_id == entity["data"].get("event_id"):
+        # Already on that event — often because another analyst moved it
+        # first. Report current ownership so the late caller sees who holds
+        # the report.
+        raise ConflictError(
+            "report %s already belongs to event %s"
+            % (entity["data"].get("code"), target_event_id),
+            {
+                "report_id": entity["id"],
+                "code": entity["data"].get("code"),
+                "event_id": target_event_id,
+                "version": entity["version"],
+            },
+        )
+    if lookup is not None:
+        event = _find_one(lookup, "event", "id", target_event_id)
+        if not event:
+            raise ValidationError("event not found: " + str(target_event_id))
+    return {"event_id": target_event_id}
+
+
+def _validate_publish(actor, entity, data, lookup):
+    # The outgoing snapshot is frozen from the reviewed event plus every
+    # report that belongs to it at publish time. Later reassignments and
+    # recomputations never touch this snapshot.
+    reports = (lookup("report", "event_id", entity["id"]) or []) if lookup else []
+    return {
+        "snapshot": {
+            "event_id": entity["id"],
+            "status": entity["status"],
+            "data": dict(entity["data"]),
+            "reports": [
+                {"id": item["id"], "data": dict(item["data"])} for item in reports
+            ],
+        }
+    }
+
+
+def derive_observed_at(origin_time, time_offset):
+    try:
+        text = str(origin_time).replace("Z", "+00:00")
+        moment = datetime.fromisoformat(text)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return (moment + timedelta(seconds=float(time_offset or 0))).isoformat(timespec="seconds")
+    except (TypeError, ValueError):
+        return str(origin_time)
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -49,18 +122,54 @@ def magnitude_median(amplitudes):
     return (values[middle - 1] + values[middle]) / 2.0
 
 
-CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+def recompute_event(event, reports):
+    """Derive station_count and magnitude from the reports owned by an event.
+
+    station_count is the number of distinct station codes; magnitude is the
+    median of report magnitudes. When no usable magnitude is present the
+    previously recorded value is kept.
+    """
+    data = dict(event["data"])
+    stations = {
+        item["data"].get("station")
+        for item in reports
+        if item.get("data", {}).get("station")
+    }
+    data["station_count"] = len(stations)
+    magnitudes = []
+    for item in reports:
+        value = item.get("data", {}).get("magnitude")
+        if value is None or value == "":
+            continue
+        try:
+            magnitudes.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if magnitudes:
+        data["magnitude"] = magnitude_median(magnitudes)
+    return data
+
+
+# An event is sent back to review whenever its report ownership changes after
+# it had already been published.
+REASSIGN_FALLBACK_STATUS = "pending_review"
+
+CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event, 'report': _validate_report}
+CUSTOM_TRANSITIONS = {
+    ('event', 'associate'): _validate_associate,
+    ('event', 'publish'): _validate_publish,
+    ('report', 'reassign'): _validate_reassign,
+}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'reports': 'report'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'report': 'active'}
+    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated', 'pending_review'), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}, 'report': {'reassign': (('active',), 'active')}}
+    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location'), 'report': ('code', 'observed_at', 'event_id', 'station')}
+    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',), ('report', 'reassign'): ('event_id',)}
+    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst'), 'report': ('admin', 'analyst', 'station')}
+    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer'), 'reassign': ('admin', 'analyst')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
