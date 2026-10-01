@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -8,24 +8,80 @@ from .domain import (
 )
 
 
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def _validate_station(actor, data, lookup):
     if not data.get("code"):
         raise ValidationError("station code is required")
 
 
 def _validate_event(actor, data, lookup):
-    reports = data.get("reports") or []
-    if len(reports) < 2:
-        raise ValidationError("event requires at least two station reports")
     if not data.get("title"):
         raise ValidationError("event title is required")
 
 
+def _validate_report(actor, data, lookup):
+    if not data.get("observed_at"):
+        raise ValidationError("report observed_at is required")
+    event_id = data.get("event_id")
+    if event_id:
+        target = _find_one(lookup, "event", "id", event_id)
+        if not target:
+            raise ValidationError("report event not found: " + str(event_id))
+
+
 def _validate_associate(actor, entity, data, lookup):
-    reports = entity["data"].get("reports") or []
+    reports = lookup("report", "event_id", entity["id"]) or []
     if len(reports) < 2:
         raise ValidationError("two reports are required for association")
     return {"associated_count": len(reports)}
+
+
+def _validate_review(actor, entity, data, lookup):
+    reports = lookup("report", "event_id", entity["id"]) or []
+    amplitudes = [
+        item["data"].get("amplitude")
+        for item in reports
+        if item["data"].get("amplitude") is not None
+    ]
+    computed = magnitude_median(amplitudes) if amplitudes else None
+    patch = {"station_count": len(reports)}
+    if data.get("magnitude") is None and computed is not None:
+        patch["magnitude"] = computed
+    return patch
+
+
+def _validate_publish(actor, entity, data, lookup):
+    reports = lookup("report", "event_id", entity["id"]) or []
+    snapshot = {
+        "title": entity["data"].get("title"),
+        "origin_time": entity["data"].get("origin_time"),
+        "location": entity["data"].get("location"),
+        "magnitude": entity["data"].get("magnitude"),
+        "station_count": entity["data"].get("station_count"),
+        "reports": [
+            {
+                "code": item["data"].get("code"),
+                "station": item["data"].get("station"),
+                "amplitude": item["data"].get("amplitude"),
+            }
+            for item in reports
+        ],
+        "communication_id": data.get("communication_id"),
+        "published_at": utcnow(),
+    }
+    return {"published_snapshot": snapshot}
+
+
+def _validate_report_assign(actor, entity, data, lookup):
+    event_id = data.get("event_id")
+    if event_id is not None:
+        target = _find_one(lookup, "event", "id", event_id)
+        if not target:
+            raise ValidationError("target event not found: " + str(event_id))
+    return {"event_id": event_id}
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -49,18 +105,81 @@ def magnitude_median(amplitudes):
     return (values[middle - 1] + values[middle]) / 2.0
 
 
-CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+def recompute_event(event, reports):
+    """Derive magnitude/station_count from assigned reports.
+
+    Returns (patch, next_status). Published/revised events revert to
+    pending review (reviewed) when their report set changes.
+    """
+    station_count = len(reports)
+    amplitudes = [
+        item["data"].get("amplitude")
+        for item in reports
+        if item["data"].get("amplitude") is not None
+    ]
+    magnitude = magnitude_median(amplitudes) if amplitudes else None
+    patch = {"station_count": station_count, "magnitude": magnitude}
+    next_status = event["status"]
+    if event["status"] in ("published", "revised"):
+        next_status = "reviewed"
+    return patch, next_status
+
+
+CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event, 'report': _validate_report}
+CUSTOM_TRANSITIONS = {
+    ('event', 'associate'): _validate_associate,
+    ('event', 'review'): _validate_review,
+    ('event', 'publish'): _validate_publish,
+    ('report', 'assign'): _validate_report_assign,
+}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'reports': 'report'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'report': 'active'}
+    TRANSITIONS = {
+        'station': {
+            'offline': (('online',), 'offline'),
+            'online': (('offline',), 'online'),
+        },
+        'event': {
+            'associate': (('candidate',), 'associated'),
+            'review': (('associated',), 'reviewed'),
+            'publish': (('reviewed',), 'published'),
+            'revise': (('published', 'revised'), 'revised'),
+            'withdraw': (('published', 'revised'), 'withdrawn'),
+        },
+        'report': {
+            'assign': (('active',), 'active'),
+        },
+    }
+    CREATE_REQUIRED = {
+        'station': ('code', 'lat', 'lon'),
+        'event': ('title', 'origin_time', 'location'),
+        'report': ('observed_at',),
+    }
+    ACTION_REQUIRED = {
+        ('station', 'offline'): ('reason',),
+        ('event', 'review'): ('reviewer',),
+        ('event', 'publish'): ('communication_id',),
+        ('event', 'revise'): ('reason', 'magnitude'),
+        ('event', 'withdraw'): ('reason',),
+    }
+    CREATE_ROLES = {
+        'station': ('admin', 'station'),
+        'event': ('admin', 'analyst'),
+        'report': ('admin', 'station', 'analyst'),
+    }
+    ROLE_ACTIONS = {
+        'offline': ('admin', 'station'),
+        'online': ('admin', 'station'),
+        'associate': ('admin', 'analyst'),
+        'review': ('admin', 'reviewer'),
+        'publish': ('admin', 'reviewer'),
+        'revise': ('admin', 'reviewer'),
+        'withdraw': ('admin', 'reviewer'),
+        'assign': ('admin', 'analyst'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

@@ -54,6 +54,17 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS counters (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS batch_imports (
+                    batch_key TEXT NOT NULL,
+                    ref TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(batch_key, ref)
+                );
             """)
 
     @staticmethod
@@ -194,6 +205,35 @@ class SQLiteRepository:
                 "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
+            )
+
+    def next_counter(self, name):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO counters(name, value) VALUES (?, 0)", (name,)
+            )
+            connection.execute(
+                "UPDATE counters SET value = value + 1 WHERE name = ?", (name,)
+            )
+            row = connection.execute(
+                "SELECT value FROM counters WHERE name = ?", (name,)
+            ).fetchone()
+        return int(row["value"])
+
+    def get_batch_item(self, batch_key, ref):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT entity_id FROM batch_imports WHERE batch_key = ? AND ref = ?",
+                (batch_key, ref),
+            ).fetchone()
+        return row["entity_id"] if row else None
+
+    def save_batch_item(self, batch_key, ref, entity_id):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO batch_imports(batch_key, ref, entity_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (batch_key, ref, entity_id, utcnow()),
             )
 
     def ping(self):
